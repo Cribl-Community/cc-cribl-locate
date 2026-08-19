@@ -125,6 +125,11 @@ export async function createAppPack(dev = false) {
     await cp(policiesPath, join(buildDir, 'default', 'policies.yml'));
   }
 
+  const licensePath = join(rootDir, 'LICENSE');
+  if (await pathExists(licensePath)) {
+    await cp(licensePath, join(buildDir, 'LICENSE'));
+  }
+
   const rootPackageJson = JSON.parse(
     await readFile(join(rootDir, 'package.json'), 'utf8')
   );
