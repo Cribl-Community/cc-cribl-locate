@@ -1,0 +1,21 @@
+# Product API access declaration. Declare Cribl product API paths this app needs.
+# At install time, admins see exactly which platform resources the app will use.
+# Cribl Locate only reads configuration (GET) — it never modifies anything.
+
+policies:
+  # List all Worker Groups / Edge Fleets to know what to search.
+  - object: '/master/groups'
+    actions: ['GET']
+
+  # Read Sources (inputs), Destinations (outputs), and Routes within each group.
+  # Group-contextual paths use the /m/:gid prefix.
+  - object: '/m/:gid/system/inputs'
+    actions: ['GET']
+  - object: '/m/:gid/system/outputs'
+    actions: ['GET']
+  - object: '/m/:gid/routes'
+    actions: ['GET']
+  - object: '/m/:gid/pipelines'
+    actions: ['GET']
+  - object: '/m/:gid/collectors'
+    actions: ['GET']
