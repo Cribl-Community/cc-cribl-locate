@@ -7,11 +7,13 @@ import {
   Divider,
   EmptyState,
   Link,
+  PasswordField,
   Radio,
   RadioGroup,
   Spinner,
   Tag,
   Text,
+  TextField,
 } from '@capra/core';
 import {
   ApiOutlined,
@@ -26,6 +28,16 @@ import {
 } from '@capra/icons';
 import type { SvgIcon } from '@capra/icons';
 import { type ConfigGroup, type ResourceKind, listGroups } from './api';
+import {
+  type StepResult,
+  type Workspace,
+  type XwsConfig,
+  XwsError,
+  inCribl,
+  loadConfig,
+  saveConfig,
+  testConnection,
+} from './xws';
 import {
   type GroupError,
   type MatchMode,
@@ -167,6 +179,175 @@ function ResultRow({ result }: { result: SearchResult }) {
         <pre className="config-dump">{JSON.stringify(result.raw, null, 2)}</pre>
       )}
     </div>
+  );
+}
+
+/**
+ * SPIKE panel: verifies the app can reach Cribl.Cloud, mint an OAuth token, and
+ * list the org's workspaces. This proves external egress + auth before the full
+ * cross-workspace search (per-leader fan-out) is built.
+ */
+function CrossWorkspacePanel() {
+  const [open, setOpen] = useState(false);
+  const [cfg, setCfg] = useState<XwsConfig>({ orgId: '', clientId: '', clientSecret: '' });
+  const [testing, setTesting] = useState(false);
+  const [steps, setSteps] = useState<StepResult[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Load any previously-saved connection config from the app KV store.
+  useEffect(() => {
+    if (!inCribl()) return;
+    const ac = new AbortController();
+    loadConfig(ac.signal)
+      .then((saved) => {
+        if (saved && !ac.signal.aborted) setCfg(saved);
+      })
+      .catch(() => {
+        /* no saved config yet — ignore */
+      });
+    return () => ac.abort();
+  }, []);
+
+  const setField = (k: keyof XwsConfig) => (value: string) =>
+    setCfg((prev) => ({ ...prev, [k]: value }));
+
+  const canTest =
+    cfg.orgId.trim() !== '' &&
+    cfg.clientId.trim() !== '' &&
+    cfg.clientSecret.trim() !== '' &&
+    !testing;
+
+  const runTest = useCallback(async () => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setTesting(true);
+    setError(null);
+    setSteps([]);
+    setWorkspaces(null);
+    try {
+      // Persist so the connection survives a reload (KV, not browser storage).
+      await saveConfig(cfg, ac.signal).catch(() => {});
+      const outcome = await testConnection(cfg, ac.signal);
+      if (ac.signal.aborted) return;
+      setSteps(outcome.steps);
+      setWorkspaces(outcome.workspaces);
+    } catch (e) {
+      if (ac.signal.aborted) return;
+      if (e instanceof XwsError) {
+        setSteps(e.steps);
+        setError(e.message);
+      } else {
+        setError((e as Error).message);
+      }
+    } finally {
+      if (abortRef.current === ac) setTesting(false);
+    }
+  }, [cfg]);
+
+  return (
+    <section className="xws-panel">
+      <button
+        type="button"
+        className="section-head"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className={`section-caret${open ? '' : ' collapsed'}`} aria-hidden>
+          <ChevronDown size="xs" />
+        </span>
+        <Text variant="body">
+          <strong>Cross-workspace search</strong>
+        </Text>
+        <Tag color="highlight" size="sm">
+          beta
+        </Tag>
+      </button>
+
+      {open && (
+        <div className="xws-body">
+          <Text>
+            Connect an org-level Cribl.Cloud API credential to search across other
+            workspaces. Enter an API client (Organization &rsaquo; API Credentials) with
+            permission to read workspaces, then test the connection.
+          </Text>
+
+          {!inCribl() && (
+            <Alert appearance="warning" layout="inline" title="Runs in Cribl only">
+              External calls go through the platform proxy, which isn't available under{' '}
+              <code>npm run dev</code>. Install the app in Cribl Cloud to test.
+            </Alert>
+          )}
+
+          <div className="xws-form">
+            <TextField
+              label="Organization ID"
+              placeholder="your-org-id"
+              value={cfg.orgId}
+              onChange={setField('orgId')}
+            />
+            <TextField
+              label="API Client ID"
+              placeholder="client id"
+              value={cfg.clientId}
+              onChange={setField('clientId')}
+            />
+            <PasswordField
+              label="API Client Secret"
+              placeholder="client secret"
+              value={cfg.clientSecret}
+              onChange={setField('clientSecret')}
+            />
+          </div>
+
+          <div className="xws-actions">
+            <Button variant="primary" disabled={!canTest} onPress={runTest}>
+              {testing ? 'Testing…' : 'Test connection'}
+            </Button>
+            {testing && <Spinner size="sm" />}
+          </div>
+
+          {steps.length > 0 && (
+            <ul className="xws-steps">
+              {steps.map((s, i) => (
+                <li key={i} className={s.ok ? 'ok' : 'fail'}>
+                  <strong>{s.ok ? '✓' : '✗'} {s.step}</strong>
+                  <span>{s.detail}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {error && (
+            <Alert appearance="danger" layout="inline" title="Connection failed">
+              {error}
+            </Alert>
+          )}
+
+          {workspaces && (
+            <div className="xws-results">
+              <Text variant="body">
+                <strong>{workspaces.length}</strong> workspace
+                {workspaces.length === 1 ? '' : 's'} visible:
+              </Text>
+              <ul className="xws-ws-list">
+                {workspaces.map((w) => (
+                  <li key={w.workspaceId}>
+                    <Tag color="brand" size="sm">
+                      {w.name || w.workspaceId}
+                    </Tag>
+                    {w.state && <span className="result-dim">{w.state}</span>}
+                    {w.leaderFQDN && <code className="term-chip">{w.leaderFQDN}</code>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -376,6 +557,8 @@ function App() {
           </Text>
         </div>
       </header>
+
+      <CrossWorkspacePanel />
 
       {groupsError && (
         <Alert appearance="danger" title="Couldn't load Worker Groups">

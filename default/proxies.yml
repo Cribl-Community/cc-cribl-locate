@@ -1,27 +1,39 @@
 # External API declaration. Declare domains your app needs to reach.
 # At install time, admins see exactly which endpoints the app will use.
+#
+# Cross-workspace search (SPIKE): to search across other Cribl.Cloud workspaces
+# the app acts as an org-level control-plane client. This declares the two fixed
+# domains that spike needs:
+#   - login.cribl.cloud  — OAuth client-credentials token exchange
+#   - api.cribl.cloud    — org-level workspace listing
+# The per-workspace leader FQDNs (e.g. main-<ws>-<org>.cribl.cloud) are NOT
+# declared yet — that fan-out is the next step and depends on whether the proxy
+# supports wildcard domains.
 
-# api.example.com:
-#   paths:
-#     allowlist:
-#       - /v1/
-#       - /api/public/
-#     blocklist:
-#       - /v1/internal/
-#       - /api/admin/
-#   headers:
-#     inject:
-#       Authorization: '`Bearer ${kv.api_key}`'
-#       X-API-Version: '2024-01'
-#     allowlist:
-#       - Content-Type
-#       - x-request-id
-#       - x-*
-#     blocklist:
-#       - X-Sensitive-Header
-#       - Cookie
-#   timeout: 30000
-#   # Verify the upstream TLS certificate chain. Leave as `true` for production
-#   # endpoints. Set to `false` only when targeting trusted internal endpoints
-#   # that present self-signed or otherwise untrusted certificates.
-#   rejectUnauthorized: true
+# OAuth token endpoint. No injected auth — client_id/secret travel in the body.
+login.cribl.cloud:
+  paths:
+    allowlist:
+      - /oauth/token
+  headers:
+    allowlist:
+      - Content-Type
+      - Accept
+  timeout: 30000
+  rejectUnauthorized: true
+
+# Cribl.Cloud org-level API. The app cannot set Authorization directly (the
+# proxy strips it), so the Bearer token is injected from the app KV store.
+# The app writes the freshly-minted token to KV key `xwsAccessToken` first.
+api.cribl.cloud:
+  paths:
+    allowlist:
+      - /v2/organizations/
+  headers:
+    inject:
+      Authorization: "'Bearer ' + kv.xwsAccessToken"
+    allowlist:
+      - Content-Type
+      - Accept
+  timeout: 30000
+  rejectUnauthorized: true
