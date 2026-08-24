@@ -197,12 +197,21 @@ function CrossWorkspacePanel() {
   const abortRef = useRef<AbortController | null>(null);
 
   // Load any previously-saved connection config from the app KV store.
+  // Normalize every field to a string — a saved value with a missing field (or
+  // an unexpected KV shape) must not leave `cfg.<field>` undefined, or the
+  // `.trim()` guards below throw and crash the panel.
   useEffect(() => {
     if (!inCribl()) return;
     const ac = new AbortController();
     loadConfig(ac.signal)
       .then((saved) => {
-        if (saved && !ac.signal.aborted) setCfg(saved);
+        if (saved && !ac.signal.aborted) {
+          setCfg({
+            orgId: saved.orgId ?? '',
+            clientId: saved.clientId ?? '',
+            clientSecret: saved.clientSecret ?? '',
+          });
+        }
       })
       .catch(() => {
         /* no saved config yet — ignore */
@@ -214,9 +223,9 @@ function CrossWorkspacePanel() {
     setCfg((prev) => ({ ...prev, [k]: value }));
 
   const canTest =
-    cfg.orgId.trim() !== '' &&
-    cfg.clientId.trim() !== '' &&
-    cfg.clientSecret.trim() !== '' &&
+    (cfg.orgId ?? '').trim() !== '' &&
+    (cfg.clientId ?? '').trim() !== '' &&
+    (cfg.clientSecret ?? '').trim() !== '' &&
     !testing;
 
   const runTest = useCallback(async () => {
