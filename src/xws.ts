@@ -65,30 +65,33 @@ export function inCribl(): boolean {
 
 // --- App KV store helpers ----------------------------------------------------
 
-async function kvGet<T>(key: string, signal?: AbortSignal): Promise<T | null> {
-  const res = await fetch(`${API()}/kvstore/${key}`, {
-    headers: { Accept: 'application/json' },
-    signal,
-  });
+// The app KV store takes the value as the RAW request body with
+// `Content-Type: text/plain` — not a JSON object. Structured data must be
+// stringified by us and parsed back on read. Secrets are written with
+// `?encrypted=true`; they can then only be read at the proxy egress boundary
+// (where proxies.yml injects them) and are redacted if the app reads them back.
+
+/** Read a key's raw text value. Returns null on 404 / empty. */
+async function kvGetText(key: string, signal?: AbortSignal): Promise<string | null> {
+  const res = await fetch(`${API()}/kvstore/${key}`, { signal });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`KV get ${key}: ${res.status} ${res.statusText}`);
   const text = await res.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    // Value was stored as a raw (non-JSON) string.
-    return text as unknown as T;
-  }
+  return text ? text : null;
 }
 
-async function kvPut(key: string, value: unknown, signal?: AbortSignal): Promise<void> {
-  // The KV store parses the body as JSON, so even a plain string must be
-  // JSON-encoded (a bare token is not valid JSON and yields a 400).
-  const res = await fetch(`${API()}/kvstore/${key}`, {
+/** Write a raw scalar value. Pass `encrypted` for secrets (e.g. tokens). */
+async function kvPutText(
+  key: string,
+  value: string,
+  encrypted: boolean,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = `${API()}/kvstore/${key}${encrypted ? '?encrypted=true' : ''}`;
+  const res = await fetch(url, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(value),
+    headers: { 'Content-Type': 'text/plain' },
+    body: value,
     signal,
   });
   if (!res.ok) {
@@ -99,12 +102,21 @@ async function kvPut(key: string, value: unknown, signal?: AbortSignal): Promise
 
 // --- Config persistence ------------------------------------------------------
 
-export function loadConfig(signal?: AbortSignal): Promise<XwsConfig | null> {
-  return kvGet<XwsConfig>(KV_CONFIG_KEY, signal);
+export async function loadConfig(signal?: AbortSignal): Promise<XwsConfig | null> {
+  const text = await kvGetText(KV_CONFIG_KEY, signal);
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as XwsConfig;
+  } catch {
+    return null;
+  }
 }
 
+// Config is stored unencrypted so the app can read the client secret back to
+// perform the OAuth exchange (encrypted values are redacted on read). The
+// minted access token, by contrast, is stored encrypted — see stashToken.
 export function saveConfig(cfg: XwsConfig, signal?: AbortSignal): Promise<void> {
-  return kvPut(KV_CONFIG_KEY, cfg, signal);
+  return kvPutText(KV_CONFIG_KEY, JSON.stringify(cfg), false, signal);
 }
 
 // --- OAuth + workspace listing ----------------------------------------------
@@ -140,9 +152,13 @@ async function mintToken(cfg: XwsConfig, signal?: AbortSignal): Promise<string> 
   return data.access_token;
 }
 
-/** Stash the Bearer token in KV so proxies.yml can inject it as Authorization. */
+/**
+ * Stash the Bearer token in KV (encrypted) so proxies.yml can inject it as the
+ * Authorization header at the egress boundary. Written as a raw string, since
+ * `kv.xwsAccessToken` is a whole-key lookup used directly as `'Bearer ' + kv...`.
+ */
 function stashToken(token: string, signal?: AbortSignal): Promise<void> {
-  return kvPut(KV_TOKEN_KEY, token, signal);
+  return kvPutText(KV_TOKEN_KEY, token, true, signal);
 }
 
 interface WorkspacesResponse {
