@@ -83,14 +83,18 @@ async function kvGet<T>(key: string, signal?: AbortSignal): Promise<T | null> {
 }
 
 async function kvPut(key: string, value: unknown, signal?: AbortSignal): Promise<void> {
-  const body = typeof value === 'string' ? value : JSON.stringify(value);
+  // The KV store parses the body as JSON, so even a plain string must be
+  // JSON-encoded (a bare token is not valid JSON and yields a 400).
   const res = await fetch(`${API()}/kvstore/${key}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body,
+    body: JSON.stringify(value),
     signal,
   });
-  if (!res.ok) throw new Error(`KV put ${key}: ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`KV put ${key}: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`);
+  }
 }
 
 // --- Config persistence ------------------------------------------------------
@@ -112,9 +116,8 @@ interface TokenResponse {
 }
 
 /**
- * Exchange client credentials for an access token and stash it in KV so the
- * proxy can inject it as the Authorization header on the next call.
- * Returns the raw token so callers can log a fingerprint (never the whole token).
+ * Exchange client credentials for an access token. Returns the raw token so
+ * callers can log a fingerprint (never the whole token) and stash it in KV.
  */
 async function mintToken(cfg: XwsConfig, signal?: AbortSignal): Promise<string> {
   const res = await fetch(LOGIN_URL, {
@@ -134,8 +137,12 @@ async function mintToken(cfg: XwsConfig, signal?: AbortSignal): Promise<string> 
   }
   const data = (await res.json()) as TokenResponse;
   if (!data.access_token) throw new Error('token exchange: response missing access_token');
-  await kvPut(KV_TOKEN_KEY, data.access_token, signal);
   return data.access_token;
+}
+
+/** Stash the Bearer token in KV so proxies.yml can inject it as Authorization. */
+function stashToken(token: string, signal?: AbortSignal): Promise<void> {
+  return kvPut(KV_TOKEN_KEY, token, signal);
 }
 
 interface WorkspacesResponse {
@@ -173,16 +180,29 @@ export async function testConnection(
     );
   }
 
+  let token: string;
   try {
-    const token = await mintToken(cfg, signal);
+    token = await mintToken(cfg, signal);
     steps.push({
       step: 'OAuth token exchange (login.cribl.cloud)',
       ok: true,
-      detail: `Minted access token (…${token.slice(-6)}) and wrote it to KV "${KV_TOKEN_KEY}".`,
+      detail: `Minted access token (…${token.slice(-6)}).`,
     });
   } catch (e) {
     steps.push({ step: 'OAuth token exchange (login.cribl.cloud)', ok: false, detail: (e as Error).message });
     throw new XwsError('Could not mint an access token.', steps);
+  }
+
+  try {
+    await stashToken(token, signal);
+    steps.push({
+      step: 'Stash token in KV store',
+      ok: true,
+      detail: `Wrote the token to KV "${KV_TOKEN_KEY}" for Authorization injection.`,
+    });
+  } catch (e) {
+    steps.push({ step: 'Stash token in KV store', ok: false, detail: (e as Error).message });
+    throw new XwsError('Minted a token but could not persist it to KV for header injection.', steps);
   }
 
   try {
