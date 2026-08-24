@@ -1,14 +1,15 @@
 # External API declaration. Declare domains your app needs to reach.
 # At install time, admins see exactly which endpoints the app will use.
 #
-# Cross-workspace search (SPIKE): to search across other Cribl.Cloud workspaces
-# the app acts as an org-level control-plane client. This declares the two fixed
-# domains that spike needs:
+# Cross-workspace search: to search across other Cribl.Cloud workspaces the app
+# acts as an org-level control-plane client. This file declares the two fixed
+# domains:
 #   - login.cribl.cloud  — OAuth client-credentials token exchange
 #   - api.cribl.cloud    — org-level workspace listing
-# The per-workspace leader FQDNs (e.g. main-<ws>-<org>.cribl.cloud) are NOT
-# declared yet — that fan-out is the next step and depends on whether the proxy
-# supports wildcard domains.
+# Per-workspace leader FQDNs (e.g. main-<org>.cribl.cloud) can't be wildcarded
+# and aren't known at pack time, so they are APPENDED automatically at packaging
+# time from config/xws-workspaces.json (see scripts/pkgutil.mjs composeProxiesYml).
+# Don't add leader hosts here by hand — edit that JSON and repack instead.
 
 # OAuth token endpoint. No injected auth — client_id/secret travel in the body.
 login.cribl.cloud:

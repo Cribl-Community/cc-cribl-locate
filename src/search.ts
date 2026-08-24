@@ -12,9 +12,22 @@ import {
 
 export type MatchMode = 'any' | 'all';
 
+/**
+ * A group to search, plus where to reach it. `base` is the leader API root
+ * (undefined = the local workspace); `workspace` is the owning workspace's name
+ * for display (undefined = local). Local and remote groups are searched together.
+ */
+export interface ScopeGroup {
+  group: ConfigGroup;
+  base?: string;
+  workspace?: string;
+}
+
 export interface SearchResult {
   kind: ResourceKind;
   group: ConfigGroup;
+  /** Owning workspace name for cross-workspace results; undefined = local. */
+  workspace?: string;
   /** Stable-ish identifier for the resource. */
   id: string;
   /** Display name (falls back to id). */
@@ -38,6 +51,8 @@ export interface FieldMatch {
 
 export interface GroupError {
   group: ConfigGroup;
+  /** Owning workspace name for cross-workspace errors; undefined = local. */
+  workspace?: string;
   message: string;
 }
 
@@ -57,6 +72,7 @@ function csvCell(value: string): string {
 export function resultsToCsv(results: SearchResult[]): string {
   const header = [
     'Type',
+    'Workspace',
     'Group',
     'Group ID',
     'Name',
@@ -71,6 +87,7 @@ export function resultsToCsv(results: SearchResult[]): string {
     const matchedTerms = Array.from(new Set(r.matches.flatMap((m) => m.terms)));
     return [
       r.kind,
+      r.workspace ?? '(local)',
       r.group.name || r.group.id,
       r.group.id,
       r.name,
@@ -201,13 +218,14 @@ function matchRoute(
 }
 
 async function searchGroup(
-  group: ConfigGroup,
+  target: ScopeGroup,
   kinds: Set<ResourceKind>,
   terms: string[],
   mode: MatchMode,
   signal: AbortSignal | undefined,
   onError: (message: string) => void,
 ): Promise<SearchResult[]> {
+  const { group, base, workspace } = target;
   const out: SearchResult[] = [];
   const gid = group.id;
 
@@ -216,10 +234,10 @@ async function searchGroup(
   const scanItems = (
     kind: ResourceKind,
     label: string,
-    fetcher: (gid: string, signal?: AbortSignal) => Promise<ConfigItem[]>,
+    fetcher: (gid: string, signal?: AbortSignal, base?: string) => Promise<ConfigItem[]>,
   ) => {
     tasks.push(
-      fetcher(gid, signal)
+      fetcher(gid, signal, base)
         .then((items) => {
           for (const it of items) {
             const r = matchConfigItem(it, kind, group, terms, mode);
@@ -240,7 +258,7 @@ async function searchGroup(
 
   if (kinds.has('route')) {
     tasks.push(
-      listRoutingTables(gid, signal)
+      listRoutingTables(gid, signal, base)
         .then((tables) => {
           for (const table of tables) {
             for (const route of table.routes ?? []) {
@@ -254,7 +272,8 @@ async function searchGroup(
   }
 
   await Promise.all(tasks);
-  return out;
+  // Tag every hit with its owning workspace (local results leave it undefined).
+  return workspace ? out.map((r) => ({ ...r, workspace })) : out;
 }
 
 /**
@@ -263,7 +282,7 @@ async function searchGroup(
  * doesn't fire hundreds of requests at once.
  */
 export async function searchAll(opts: {
-  groups: ConfigGroup[];
+  groups: ScopeGroup[];
   kinds: Set<ResourceKind>;
   terms: string[];
   mode: MatchMode;
@@ -280,9 +299,9 @@ export async function searchAll(opts: {
   async function worker() {
     while (cursor < groups.length) {
       if (signal?.aborted) return;
-      const group = groups[cursor++];
-      const groupResults = await searchGroup(group, kinds, terms, mode, signal, (message) =>
-        errors.push({ group, message }),
+      const target = groups[cursor++];
+      const groupResults = await searchGroup(target, kinds, terms, mode, signal, (message) =>
+        errors.push({ group: target.group, workspace: target.workspace, message }),
       );
       results.push(...groupResults);
       done += 1;

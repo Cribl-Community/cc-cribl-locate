@@ -1,0 +1,5 @@
+{
+  "_comment": "Cross-workspace search config. Set orgId and list the workspace names to search across; the packaging script auto-generates their leader hosts into proxies.yml (you never edit proxies.yml). The app's Cross-workspace panel can generate this file's contents for you. Leave workspaces empty to disable cross-workspace leader egress. Redo + repack only when you add/remove a workspace.",
+  "orgId": "clever-wright-uno1ans",
+  "workspaces": ["nelnetmigration", "verizon"]
+}

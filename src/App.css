@@ -196,6 +196,26 @@
   gap: token('spacing.xs');
 }
 
+/* Workspace grouping (cross-workspace results) */
+.workspace-section {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.xs');
+  border-top: token('border.default');
+  padding-top: token('spacing.sm');
+}
+
+.workspace-head strong {
+  font-size: token('core.fontSize.md');
+}
+
+.workspace-body {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.xs');
+  padding-left: token('spacing.lg');
+}
+
 .section-head {
   display: flex;
   align-items: center;
@@ -422,4 +442,55 @@
   align-items: center;
   gap: token('spacing.sm');
   flex-wrap: wrap;
+}
+
+/* A workspace row that expands to reveal its worker-group checkboxes. */
+.xws-ws-item {
+  flex-direction: column;
+  align-items: stretch !important;
+}
+
+.xws-ws-head {
+  display: flex;
+  align-items: center;
+  gap: token('spacing.sm');
+  flex-wrap: wrap;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: token('spacing.xs') 0;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+
+.xws-wg {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.xs');
+  padding: token('spacing.xs') 0 token('spacing.sm') token('spacing.lg');
+}
+
+.xws-wg-bulk {
+  display: flex;
+  gap: token('spacing.sm');
+}
+
+.xws-wg-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.xs');
+}
+
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: token('color.foreground.accent.default');
+  font-size: token('core.fontSize.xs');
+  text-decoration: underline;
 }
