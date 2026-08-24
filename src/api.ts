@@ -47,8 +47,12 @@ interface Paginated<T> {
   count?: number;
 }
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(`${API()}${path}`, {
+// `base` is the API root a call targets. It defaults to the local workspace's
+// proxied leader (`window.CRIBL_API_URL`); cross-workspace search passes another
+// workspace's leader API base (`https://<leader>/api/v1`) so the same fetchers
+// read config from remote leaders.
+async function getJson<T>(path: string, signal?: AbortSignal, base?: string): Promise<T> {
+  const res = await fetch(`${base ?? API()}${path}`, {
     headers: { Accept: 'application/json' },
     signal,
   });
@@ -65,37 +69,46 @@ export async function listGroups(signal?: AbortSignal): Promise<ConfigGroup[]> {
 }
 
 /** List Sources (inputs) in a group. */
-export function listSources(gid: string, signal?: AbortSignal): Promise<ConfigItem[]> {
-  return getJson<Paginated<ConfigItem>>(`/m/${encodeURIComponent(gid)}/system/inputs`, signal).then(
-    (d) => d.items ?? [],
-  );
+export function listSources(gid: string, signal?: AbortSignal, base?: string): Promise<ConfigItem[]> {
+  return getJson<Paginated<ConfigItem>>(
+    `/m/${encodeURIComponent(gid)}/system/inputs`,
+    signal,
+    base,
+  ).then((d) => d.items ?? []);
 }
 
 /** List Destinations (outputs) in a group. */
-export function listDestinations(gid: string, signal?: AbortSignal): Promise<ConfigItem[]> {
+export function listDestinations(gid: string, signal?: AbortSignal, base?: string): Promise<ConfigItem[]> {
   return getJson<Paginated<ConfigItem>>(
     `/m/${encodeURIComponent(gid)}/system/outputs`,
     signal,
+    base,
   ).then((d) => d.items ?? []);
 }
 
 /** List routing tables in a group (flattened to individual routes by the caller). */
-export function listRoutingTables(gid: string, signal?: AbortSignal): Promise<RoutingTable[]> {
-  return getJson<Paginated<RoutingTable>>(`/m/${encodeURIComponent(gid)}/routes`, signal).then(
-    (d) => d.items ?? [],
-  );
+export function listRoutingTables(gid: string, signal?: AbortSignal, base?: string): Promise<RoutingTable[]> {
+  return getJson<Paginated<RoutingTable>>(
+    `/m/${encodeURIComponent(gid)}/routes`,
+    signal,
+    base,
+  ).then((d) => d.items ?? []);
 }
 
 /** List Pipelines in a group. */
-export function listPipelines(gid: string, signal?: AbortSignal): Promise<ConfigItem[]> {
-  return getJson<Paginated<ConfigItem>>(`/m/${encodeURIComponent(gid)}/pipelines`, signal).then(
-    (d) => d.items ?? [],
-  );
+export function listPipelines(gid: string, signal?: AbortSignal, base?: string): Promise<ConfigItem[]> {
+  return getJson<Paginated<ConfigItem>>(
+    `/m/${encodeURIComponent(gid)}/pipelines`,
+    signal,
+    base,
+  ).then((d) => d.items ?? []);
 }
 
 /** List Collectors in a group. */
-export function listCollectors(gid: string, signal?: AbortSignal): Promise<ConfigItem[]> {
-  return getJson<Paginated<ConfigItem>>(`/m/${encodeURIComponent(gid)}/collectors`, signal).then(
-    (d) => d.items ?? [],
-  );
+export function listCollectors(gid: string, signal?: AbortSignal, base?: string): Promise<ConfigItem[]> {
+  return getJson<Paginated<ConfigItem>>(
+    `/m/${encodeURIComponent(gid)}/collectors`,
+    signal,
+    base,
+  ).then((d) => d.items ?? []);
 }

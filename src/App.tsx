@@ -28,19 +28,30 @@ import {
 } from '@capra/icons';
 import type { SvgIcon } from '@capra/icons';
 import { type ConfigGroup, type ResourceKind, listGroups } from './api';
+// localLeaderHost lets the panel recognize the workspace this app is installed in.
 import {
   type StepResult,
+  type WorkerGroup,
   type Workspace,
   type XwsConfig,
   XwsError,
+  fetchLeaderGroups,
+  fetchWorkerGroups,
+  groupId,
+  groupLabel,
   inCribl,
+  leaderApiBase,
+  leaderFqdnFor,
   loadConfig,
+  localLeaderHost,
+  resumeConnection,
   saveConfig,
   testConnection,
 } from './xws';
 import {
   type GroupError,
   type MatchMode,
+  type ScopeGroup,
   type SearchResult,
   parseTerms,
   resultsToCsv,
@@ -73,21 +84,25 @@ const emptyCounts = (): Record<ResourceKind, number> => ({
   pipeline: 0,
 });
 
-type GroupCategory = 'stream' | 'edge';
-
-const CATEGORY_ORDER: GroupCategory[] = ['stream', 'edge'];
-
-const CATEGORY_LABEL: Record<GroupCategory, string> = {
-  stream: 'Stream Worker Groups',
-  edge: 'Edge Fleets',
-};
-
-/** Classify a config group so Edge Fleets can be scoped separately from Stream Worker Groups. */
-function groupCategory(g: ConfigGroup): GroupCategory {
-  return g.isFleet ? 'edge' : 'stream';
+/** Group and sort search results by resource kind. */
+function groupByKind(list: SearchResult[]): Record<ResourceKind, SearchResult[]> {
+  const byKind: Record<ResourceKind, SearchResult[]> = {
+    source: [],
+    destination: [],
+    route: [],
+    pipeline: [],
+  };
+  for (const r of list) byKind[r.kind].push(r);
+  for (const k of ALL_KINDS)
+    byKind[k].sort(
+      (a, b) =>
+        (a.group.name || a.group.id).localeCompare(b.group.name || b.group.id) ||
+        a.name.localeCompare(b.name),
+    );
+  return byKind;
 }
 
-/** Outpost groups aren't Stream Worker Groups or Edge Fleets, so we hide them. */
+/** Outpost groups aren't Stream Worker Groups, so we hide them. */
 function isOutpostGroup(g: ConfigGroup): boolean {
   return [g.product, g.type].some((v) => typeof v === 'string' && v.toLowerCase().includes('outpost'));
 }
@@ -145,14 +160,14 @@ function ResultRow({ result }: { result: SearchResult }) {
             <Tag color={meta.color} size="sm" icon={Icon}>
               {meta.label}
             </Tag>
+            {result.workspace && (
+              <Tag color="highlight" size="sm">
+                {result.workspace}
+              </Tag>
+            )}
             <Tag color="brand" size="sm">
               {result.group.name || result.group.id}
             </Tag>
-            {result.group.isFleet && (
-              <Tag color="default" size="sm">
-                fleet
-              </Tag>
-            )}
             {result.tableId && (
               <span className="result-dim">route group: {result.tableId}</span>
             )}
@@ -167,9 +182,11 @@ function ResultRow({ result }: { result: SearchResult }) {
           </ul>
         </div>
         <div className="result-actions">
-          <Link href={groupHref(result.group)} target="_top">
-            Open group <LinkOutlined size="xs" />
-          </Link>
+          {!result.workspace && (
+            <Link href={groupHref(result.group)} target="_top">
+              Open group <LinkOutlined size="xs" />
+            </Link>
+          )}
           <button className="linklike" onClick={() => setOpen((o) => !o)}>
             {open ? 'Hide config' : 'View config'}
           </button>
@@ -187,7 +204,12 @@ function ResultRow({ result }: { result: SearchResult }) {
  * list the org's workspaces. This proves external egress + auth before the full
  * cross-workspace search (per-leader fan-out) is built.
  */
-function CrossWorkspacePanel() {
+function CrossWorkspacePanel({
+  onScopeChange,
+}: {
+  /** Reports the currently-selected remote worker groups so the main Search can fan out to them. */
+  onScopeChange: (scope: ScopeGroup[]) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [cfg, setCfg] = useState<XwsConfig>({ orgId: '', clientId: '', clientSecret: '' });
   const [testing, setTesting] = useState(false);
@@ -196,39 +218,217 @@ function CrossWorkspacePanel() {
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Load any previously-saved connection config from the app KV store.
-  // Normalize every field to a string — a saved value with a missing field (or
-  // an unexpected KV shape) must not leave `cfg.<field>` undefined, or the
-  // `.trim()` guards below throw and crash the panel.
-  useEffect(() => {
-    if (!inCribl()) return;
-    const ac = new AbortController();
-    loadConfig(ac.signal)
-      .then((saved) => {
-        if (saved && !ac.signal.aborted) {
-          setCfg({
-            orgId: saved.orgId ?? '',
-            clientId: saved.clientId ?? '',
-            clientSecret: saved.clientSecret ?? '',
+  // Per-workspace worker-group state. Keyed by workspace name (the path param
+  // the management-plane API expects). Groups are loaded lazily when a
+  // workspace row is expanded, so we don't fan out to every workspace up front.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [wgByWs, setWgByWs] = useState<Record<string, WorkerGroup[]>>({});
+  const [wgLoading, setWgLoading] = useState<Set<string>>(new Set());
+  const [wgError, setWgError] = useState<Record<string, string>>({});
+  // Workspaces whose groups came from the incomplete management-plane fallback
+  // (leader egress not yet declared in proxies.yml) — hybrid groups may be missing.
+  // Value is the resolved leader FQDN + why the direct leader read failed, so the
+  // warning can show the real cause (blocked egress vs 401 audience vs wrong FQDN).
+  const [wgIncomplete, setWgIncomplete] = useState<Record<string, { fqdn: string; reason: string }>>(
+    {},
+  );
+  // Search scope: set of `${workspaceName}::${groupName}` keys — defaults to
+  // every non-search worker group across every workspace (see the eager-load
+  // effect below). The per-workspace checkboxes let the user narrow it down.
+  const [scope, setScope] = useState<Set<string>>(new Set());
+  const wgAbortsRef = useRef<AbortController[]>([]);
+
+  // Abort any in-flight worker-group loads when the panel unmounts.
+  useEffect(
+    () => () => {
+      for (const ac of wgAbortsRef.current) ac.abort();
+    },
+    [],
+  );
+
+  const scopeKey = (wsName: string, groupName: string) => `${wsName}::${groupName}`;
+
+  // Leader host of the workspace this app is installed in (if determinable). The
+  // org workspace listing includes this workspace, so we recognize it to (a) read
+  // its complete group list from the local leader (/master, incl. hybrid) and (b)
+  // search it via CRIBL_API_URL — no proxies.yml entry needed for our own host.
+  const localHost = useMemo(() => localLeaderHost(), []);
+
+  const loadWorkerGroups = useCallback(
+    async (ws: Workspace) => {
+      const wsName = ws.name || ws.workspaceId;
+      if (wgByWs[wsName] || wgLoading.has(wsName)) return; // already loaded / loading
+      const orgId = (cfg.orgId ?? '').trim();
+      setWgLoading((prev) => new Set(prev).add(wsName));
+      setWgError((prev) => {
+        const next = { ...prev };
+        delete next[wsName];
+        return next;
+      });
+      const ac = new AbortController();
+      wgAbortsRef.current.push(ac);
+      try {
+        const fqdn = leaderFqdnFor(orgId, ws);
+        const isLocal = localHost != null && fqdn === localHost;
+        let gs: WorkerGroup[];
+        let leaderErr: string | null = null;
+        if (isLocal) {
+          // Our own workspace: read the complete group list from the local leader
+          // (/master/groups via CRIBL_API_URL, includes hybrid/on-prem) — the same
+          // source the local-only search uses, and no proxies.yml entry required.
+          const local = await listGroups(ac.signal);
+          gs = local
+            .filter((g) => !g.isSearch && !g.isFleet && !isOutpostGroup(g))
+            .map((g) => ({
+              id: g.id,
+              name: g.name ?? g.id,
+              isFleet: g.isFleet,
+              isSearch: g.isSearch,
+              type: g.type,
+              product: g.product,
+            }));
+        } else {
+          // Prefer the leader's complete inventory (includes hybrid/on-prem groups);
+          // if its FQDN isn't declared in proxies.yml yet, egress is blocked, so
+          // fall back to the management-plane list and flag it as incomplete.
+          try {
+            gs = await fetchLeaderGroups(fqdn, ac.signal);
+          } catch (le) {
+            if (ac.signal.aborted) return;
+            leaderErr = (le as Error).message;
+            gs = await fetchWorkerGroups(orgId, wsName, ac.signal);
+          }
+        }
+        if (ac.signal.aborted) return;
+        setWgByWs((prev) => ({ ...prev, [wsName]: gs }));
+        setWgIncomplete((prev) => {
+          const next = { ...prev };
+          if (leaderErr) next[wsName] = { fqdn, reason: leaderErr };
+          else delete next[wsName];
+          return next;
+        });
+        // Default to searching every group in the workspace; the user narrows down.
+        setScope((prev) => {
+          const next = new Set(prev);
+          for (const g of gs) next.add(scopeKey(wsName, groupId(g)));
+          return next;
+        });
+      } catch (e) {
+        if (ac.signal.aborted) return;
+        setWgError((prev) => ({ ...prev, [wsName]: (e as Error).message }));
+      } finally {
+        if (!ac.signal.aborted) {
+          setWgLoading((prev) => {
+            const next = new Set(prev);
+            next.delete(wsName);
+            return next;
           });
         }
-      })
-      .catch(() => {
-        /* no saved config yet — ignore */
-      });
-    return () => ac.abort();
-  }, []);
+      }
+    },
+    [cfg.orgId, wgByWs, wgLoading, localHost],
+  );
 
-  const setField = (k: keyof XwsConfig) => (value: string) =>
-    setCfg((prev) => ({ ...prev, [k]: value }));
+  // The app searches across ALL workspaces and ALL their (non-search) worker
+  // groups by default, so load every workspace's groups as soon as they're
+  // listed — each load auto-selects its groups into the scope. loadWorkerGroups
+  // is idempotent (it no-ops for workspaces already loaded/loading), so this is
+  // safe to re-run; expanding a row just reveals what's already loaded.
+  useEffect(() => {
+    if (!workspaces) return;
+    for (const ws of workspaces) void loadWorkerGroups(ws);
+  }, [workspaces, loadWorkerGroups]);
 
-  const canTest =
-    (cfg.orgId ?? '').trim() !== '' &&
-    (cfg.clientId ?? '').trim() !== '' &&
-    (cfg.clientSecret ?? '').trim() !== '' &&
-    !testing;
+  // The full search scope, resolved to searchable targets. Because the org
+  // workspace listing includes the workspace this app is installed in, this is
+  // the single source of truth for the main Search — the local workspace is
+  // routed via CRIBL_API_URL (no `base`, no workspace label, so its results keep
+  // the "Local workspace" grouping and Open-group links), and every other
+  // workspace via its leader API base. This means Search never double-counts or
+  // double-searches the local workspace.
+  const remoteScope = useMemo<ScopeGroup[]>(() => {
+    if (!workspaces) return [];
+    const orgId = (cfg.orgId ?? '').trim();
+    const out: ScopeGroup[] = [];
+    for (const ws of workspaces) {
+      const wsName = ws.name || ws.workspaceId;
+      const groups = wgByWs[wsName];
+      if (!groups) continue;
+      const fqdn = leaderFqdnFor(orgId, ws);
+      const isLocal = localHost != null && fqdn === localHost;
+      const base = isLocal ? undefined : leaderApiBase(fqdn);
+      for (const g of groups) {
+        if (!scope.has(scopeKey(wsName, groupId(g)))) continue;
+        out.push({
+          group: {
+            id: groupId(g),
+            name: groupLabel(g),
+            isFleet: g.isFleet,
+            isSearch: g.isSearch,
+            type: g.type,
+            product: g.product,
+          },
+          base,
+          workspace: isLocal ? undefined : wsName,
+        });
+      }
+    }
+    return out;
+  }, [workspaces, wgByWs, scope, cfg.orgId, localHost]);
 
-  const runTest = useCallback(async () => {
+  // setRemoteScope from the parent is stable, so this just mirrors the derived
+  // scope up whenever the selection changes.
+  useEffect(() => onScopeChange(remoteScope), [remoteScope, onScopeChange]);
+
+  const toggleExpand = (ws: Workspace) => {
+    const wsName = ws.name || ws.workspaceId;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(wsName)) next.delete(wsName);
+      else {
+        next.add(wsName);
+        void loadWorkerGroups(ws);
+      }
+      return next;
+    });
+  };
+
+  const toggleGroup = (wsName: string, groupName: string) => {
+    const key = scopeKey(wsName, groupName);
+    setScope((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  // Select / clear every group in a workspace at once.
+  const setAllGroups = (wsName: string, groups: WorkerGroup[], select: boolean) => {
+    setScope((prev) => {
+      const next = new Set(prev);
+      for (const g of groups) {
+        const key = scopeKey(wsName, groupId(g));
+        if (select) next.add(key);
+        else next.delete(key);
+      }
+      return next;
+    });
+  };
+
+  const configComplete = (c: XwsConfig) =>
+    (c.orgId ?? '').trim() !== '' &&
+    (c.clientId ?? '').trim() !== '' &&
+    (c.clientSecret ?? '').trim() !== '';
+
+  // Connect and (via the eager-load effect) pull every workspace's worker groups
+  // into the search scope. When the client secret is present (user clicked Test
+  // connection) this mints a fresh token; otherwise it resumes using the token
+  // already stored in KV — so the secret is never needed on reload. Takes the
+  // config explicitly so it can run from a fresh `cfg` or just-loaded saved
+  // credentials without waiting for a state update. Stable identity (only stable
+  // setters captured) so effects can depend on it safely.
+  const connect = useCallback(async (config: XwsConfig) => {
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
@@ -236,10 +436,20 @@ function CrossWorkspacePanel() {
     setError(null);
     setSteps([]);
     setWorkspaces(null);
+    // A fresh connection invalidates any previously-loaded worker groups/scope.
+    setExpanded(new Set());
+    setWgByWs({});
+    setWgError({});
+    setWgIncomplete({});
+    setScope(new Set());
     try {
-      // Persist so the connection survives a reload (KV, not browser storage).
-      await saveConfig(cfg, ac.signal).catch(() => {});
-      const outcome = await testConnection(cfg, ac.signal);
+      // Persist the non-sensitive fields (orgId/clientId) so they survive a
+      // reload; the secret is never written (see saveConfig).
+      await saveConfig(config, ac.signal).catch(() => {});
+      const hasSecret = (config.clientSecret ?? '').trim() !== '';
+      const outcome = hasSecret
+        ? await testConnection(config, ac.signal)
+        : await resumeConnection(config.orgId, ac.signal);
       if (ac.signal.aborted) return;
       setSteps(outcome.steps);
       setWorkspaces(outcome.workspaces);
@@ -254,7 +464,43 @@ function CrossWorkspacePanel() {
     } finally {
       if (abortRef.current === ac) setTesting(false);
     }
-  }, [cfg]);
+  }, []);
+
+  // Load any previously-saved connection config from the app KV store and, if
+  // it's complete, auto-connect — so cross-workspace groups are already in scope
+  // when the user searches, with no manual "Test connection" step.
+  // Normalize every field to a string — a saved value with a missing field (or
+  // an unexpected KV shape) must not leave `cfg.<field>` undefined, or the
+  // `.trim()` guards below throw and crash the panel.
+  useEffect(() => {
+    if (!inCribl()) return;
+    const ac = new AbortController();
+    loadConfig(ac.signal)
+      .then((saved) => {
+        if (saved && !ac.signal.aborted) {
+          const next: XwsConfig = {
+            orgId: saved.orgId ?? '',
+            clientId: saved.clientId ?? '',
+            clientSecret: saved.clientSecret ?? '',
+          };
+          setCfg(next);
+          // The secret is never persisted, so `next` has none — auto-resume with
+          // the stored token whenever we have an org + client to resume for.
+          if ((next.orgId ?? '').trim() && (next.clientId ?? '').trim()) void connect(next);
+        }
+      })
+      .catch(() => {
+        /* no saved config yet — ignore */
+      });
+    return () => ac.abort();
+  }, [connect]);
+
+  const setField = (k: keyof XwsConfig) => (value: string) =>
+    setCfg((prev) => ({ ...prev, [k]: value }));
+
+  const canTest = configComplete(cfg) && !testing;
+
+  const runTest = useCallback(() => connect(cfg), [connect, cfg]);
 
   return (
     <section className="xws-panel">
@@ -305,11 +551,16 @@ function CrossWorkspacePanel() {
             />
             <PasswordField
               label="API Client Secret"
-              placeholder="client secret"
+              placeholder={workspaces ? 'saved session active — re-enter to refresh' : 'client secret'}
               value={cfg.clientSecret}
               onChange={setField('clientSecret')}
             />
           </div>
+
+          <span className="xws-hint result-dim">
+            The client secret is used once to mint an access token and is never stored. Only the
+            token is saved (encrypted); when it expires, re-enter the secret and test again.
+          </span>
 
           <div className="xws-actions">
             <Button variant="primary" disabled={!canTest} onPress={runTest}>
@@ -339,19 +590,122 @@ function CrossWorkspacePanel() {
             <div className="xws-results">
               <Text variant="body">
                 <strong>{workspaces.length}</strong> workspace
-                {workspaces.length === 1 ? '' : 's'} visible:
+                {workspaces.length === 1 ? '' : 's'} visible
+                {scope.size > 0 && (
+                  <>
+                    {' — '}
+                    <strong>{scope.size}</strong> worker group
+                    {scope.size === 1 ? '' : 's'} selected for search scope
+                  </>
+                )}
+                :
               </Text>
               <ul className="xws-ws-list">
-                {workspaces.map((w) => (
-                  <li key={w.workspaceId}>
-                    <Tag color="brand" size="sm">
-                      {w.name || w.workspaceId}
-                    </Tag>
-                    {w.state && <span className="result-dim">{w.state}</span>}
-                    {w.leaderFQDN && <code className="term-chip">{w.leaderFQDN}</code>}
-                  </li>
-                ))}
+                {workspaces.map((w) => {
+                  const wsName = w.name || w.workspaceId;
+                  const isOpen = expanded.has(wsName);
+                  const groups = wgByWs[wsName];
+                  const loading = wgLoading.has(wsName);
+                  const err = wgError[wsName];
+                  const incomplete = wgIncomplete[wsName];
+                  const selectedCount = groups
+                    ? groups.filter((g) => scope.has(scopeKey(wsName, groupId(g)))).length
+                    : 0;
+                  return (
+                    <li key={w.workspaceId} className="xws-ws-item">
+                      <button
+                        type="button"
+                        className="xws-ws-head"
+                        onClick={() => toggleExpand(w)}
+                        aria-expanded={isOpen}
+                      >
+                        <span className={`section-caret${isOpen ? '' : ' collapsed'}`} aria-hidden>
+                          <ChevronDown size="xs" />
+                        </span>
+                        <Tag color="brand" size="sm">
+                          {wsName}
+                        </Tag>
+                        {w.state && <span className="result-dim">{w.state}</span>}
+                        {groups && (
+                          <span className="result-dim">
+                            {selectedCount}/{groups.length} group
+                            {groups.length === 1 ? '' : 's'}
+                          </span>
+                        )}
+                        {w.leaderFQDN && <code className="term-chip">{w.leaderFQDN}</code>}
+                      </button>
+
+                      {isOpen && (
+                        <div className="xws-wg">
+                          {loading && (
+                            <span className="result-dim">
+                              <Spinner size="sm" /> Loading worker groups…
+                            </span>
+                          )}
+                          {err && (
+                            <Alert appearance="danger" layout="inline" title="Couldn't list worker groups">
+                              {err}
+                            </Alert>
+                          )}
+                          {incomplete && !err && (
+                            <Alert
+                              appearance="warning"
+                              layout="inline"
+                              title="Cloud-managed groups only"
+                            >
+                              Couldn't read this workspace's leader directly, so this list comes
+                              from the management-plane API — hybrid/on-prem groups (e.g.{' '}
+                              <code>default-hybrid</code>) may be missing. Add this workspace to{' '}
+                              <code>config/xws-workspaces.json</code> and repack for the complete
+                              list.
+                              <br />
+                              <span className="result-dim">
+                                Leader <code>{incomplete.fqdn}</code> — {incomplete.reason}
+                              </span>
+                            </Alert>
+                          )}
+                          {groups && groups.length === 0 && (
+                            <span className="result-dim">No worker groups in this workspace.</span>
+                          )}
+                          {groups && groups.length > 0 && (
+                            <>
+                              <div className="xws-wg-bulk">
+                                <button
+                                  type="button"
+                                  className="linkish"
+                                  onClick={() => setAllGroups(wsName, groups, true)}
+                                >
+                                  All
+                                </button>
+                                <button
+                                  type="button"
+                                  className="linkish"
+                                  onClick={() => setAllGroups(wsName, groups, false)}
+                                >
+                                  None
+                                </button>
+                              </div>
+                              <ul className="xws-wg-list">
+                                {groups.map((g) => (
+                                  <li key={groupId(g)}>
+                                    <Checkbox
+                                      checked={scope.has(scopeKey(wsName, groupId(g)))}
+                                      onChange={() => toggleGroup(wsName, groupId(g))}
+                                    >
+                                      {groupLabel(g)}
+                                    </Checkbox>
+                                  </li>
+                                ))}
+                              </ul>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
+
             </div>
           )}
         </div>
@@ -367,6 +721,8 @@ function App() {
   const [showEnabled, setShowEnabled] = useState(true);
   const [showDisabled, setShowDisabled] = useState(true);
   const [collapsedKinds, setCollapsedKinds] = useState<Set<ResourceKind>>(new Set());
+  // Collapsed workspace sections in the results ('' = the local workspace).
+  const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<Set<string>>(new Set());
 
   const toggleCollapsed = (k: ResourceKind) =>
     setCollapsedKinds((prev) => {
@@ -376,11 +732,19 @@ function App() {
       return next;
     });
 
+  const toggleWorkspace = (key: string) =>
+    setCollapsedWorkspaces((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
   const [groups, setGroups] = useState<ConfigGroup[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(true);
   const [groupsError, setGroupsError] = useState<string | null>(null);
-  const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
-  const [showGroupPicker, setShowGroupPicker] = useState(false);
+  // Selected worker groups in other workspaces, reported by CrossWorkspacePanel.
+  const [remoteScope, setRemoteScope] = useState<ScopeGroup[]>([]);
 
   const [searching, setSearching] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
@@ -396,10 +760,9 @@ function App() {
     const ac = new AbortController();
     listGroups(ac.signal)
       .then((all) => {
-        // Only Stream Worker Groups and Edge Fleets — exclude Search and Outpost groups.
-        const gs = all.filter((g) => !g.isSearch && !isOutpostGroup(g));
+        // Only Stream Worker Groups — exclude Edge Fleets, Search, and Outpost groups.
+        const gs = all.filter((g) => !g.isSearch && !g.isFleet && !isOutpostGroup(g));
         setGroups(gs);
-        setSelectedGroups(new Set(gs.map((g) => g.id)));
       })
       .catch((e: Error) => {
         // Ignore aborts (e.g. React StrictMode remount, unmount) — they aren't real failures.
@@ -418,8 +781,23 @@ function App() {
   useEffect(() => loadGroups(), [loadGroups]);
 
   const terms = useMemo(() => parseTerms(query), [query]);
+  // Everything the Search fans out to. When the cross-workspace panel is
+  // connected it reports the FULL scope (the org listing already includes this
+  // workspace, routed via CRIBL_API_URL), so it's authoritative and the separate
+  // local `groups` list would double-count — use it only when not connected.
+  const searchScope = useMemo<ScopeGroup[]>(
+    () => (remoteScope.length ? remoteScope : groups.map((g) => ({ group: g }))),
+    [groups, remoteScope],
+  );
+  // Distinct workspaces in scope. remoteScope carries the local workspace as an
+  // `undefined` label, so the set already counts it — no +1. This matches the
+  // panel's own "N workspaces visible" count.
+  const workspaceCount = useMemo(
+    () => new Set(remoteScope.map((s) => s.workspace)).size,
+    [remoteScope],
+  );
   const canSearch =
-    terms.length > 0 && kinds.size > 0 && selectedGroups.size > 0 && !searching;
+    terms.length > 0 && kinds.size > 0 && searchScope.length > 0 && !searching;
 
   const toggleKind = (k: ResourceKind) =>
     setKinds((prev) => {
@@ -429,43 +807,15 @@ function App() {
       return next;
     });
 
-  const toggleGroup = (id: string) =>
-    setSelectedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-
-  // Groups split by category, in a stable display order, hiding empty categories.
-  const categories = useMemo(() => {
-    const byCat: Record<GroupCategory, ConfigGroup[]> = { stream: [], edge: [] };
-    for (const g of groups) byCat[groupCategory(g)].push(g);
-    for (const cat of CATEGORY_ORDER)
-      byCat[cat].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
-    return CATEGORY_ORDER.filter((cat) => byCat[cat].length > 0).map((cat) => ({
-      cat,
-      groups: byCat[cat],
-    }));
-  }, [groups]);
-
-  const setCategorySelected = (catGroups: ConfigGroup[], selected: boolean) =>
-    setSelectedGroups((prev) => {
-      const next = new Set(prev);
-      for (const g of catGroups) {
-        if (selected) next.add(g.id);
-        else next.delete(g.id);
-      }
-      return next;
-    });
-
   const runSearch = useCallback(async () => {
     if (terms.length === 0 || kinds.size === 0) return;
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
 
-    const scope = groups.filter((g) => selectedGroups.has(g.id));
+    // Search every local Worker Group plus every selected group in other
+    // workspaces — there's no picker to narrow scope.
+    const scope = searchScope;
     setSearching(true);
     setResults(null);
     setErrors([]);
@@ -496,7 +846,7 @@ function App() {
         setProgress(null);
       }
     }
-  }, [groups, kinds, selectedGroups, terms, mode]);
+  }, [searchScope, kinds, terms, mode]);
 
   const cancelSearch = () => {
     abortRef.current?.abort();
@@ -533,22 +883,65 @@ function App() {
     return c;
   }, [visibleResults]);
 
-  const grouped = useMemo(() => {
-    const byKind: Record<ResourceKind, SearchResult[]> = {
-      source: [],
-      destination: [],
-      route: [],
-      pipeline: [],
-    };
-    for (const r of visibleResults) byKind[r.kind].push(r);
-    for (const k of ALL_KINDS)
-      byKind[k].sort(
-        (a, b) =>
-          (a.group.name || a.group.id).localeCompare(b.group.name || b.group.id) ||
-          a.name.localeCompare(b.name),
-      );
-    return byKind;
+  // Results grouped by workspace (local first), for the collapsible sections.
+  // Only used when more than one workspace is present in the results.
+  const byWorkspace = useMemo(() => {
+    const map = new Map<string, SearchResult[]>();
+    for (const r of visibleResults) {
+      const key = r.workspace ?? '';
+      const bucket = map.get(key);
+      if (bucket) bucket.push(r);
+      else map.set(key, [r]);
+    }
+    const keys = Array.from(map.keys()).sort((a, b) =>
+      a === '' ? -1 : b === '' ? 1 : a.localeCompare(b),
+    );
+    return keys.map((key) => ({ key, results: map.get(key) as SearchResult[] }));
   }, [visibleResults]);
+
+  // Render the per-kind collapsible sections for one workspace's (or all)
+  // results. Reused for both the flat single-workspace layout and inside each
+  // collapsible workspace section.
+  const renderKindSections = (list: SearchResult[]) => {
+    const grouped = groupByKind(list);
+    return ALL_KINDS.filter((k) => kinds.has(k) && grouped[k].length > 0).map((k) => {
+      const isCollapsed = collapsedKinds.has(k);
+      return (
+        <div key={k} className="result-section">
+          <button
+            type="button"
+            className="section-head"
+            onClick={() => toggleCollapsed(k)}
+            aria-expanded={!isCollapsed}
+          >
+            <span className={`section-caret${isCollapsed ? ' collapsed' : ''}`} aria-hidden>
+              <ChevronDown size="xs" />
+            </span>
+            <Text variant="body">
+              <strong>{KIND_META[k].plural}</strong>
+            </Text>
+            <Badge
+              appearance="neutral"
+              count={grouped[k].length}
+              showZero
+              aria-label={`${grouped[k].length} ${KIND_META[k].plural}`}
+            />
+          </button>
+          {!isCollapsed && (
+            <>
+              <Divider />
+              {grouped[k].map((r) => (
+                <ResultRow
+                  key={`${r.workspace ?? ''}:${r.kind}:${r.group.id}:${r.tableId ?? ''}:${r.id}`}
+                  result={r}
+                />
+              ))}
+            </>
+          )}
+        </div>
+      );
+    });
+  };
 
   return (
     <div className="app">
@@ -561,13 +954,12 @@ function App() {
         </div>
         <div className="app-subtitle">
           <Text>
-            Find Sources, Destinations, and Routes by keyword across every Worker Group and
-            Fleet.
+            Find Sources, Destinations, and Routes by keyword across every Worker Group.
           </Text>
         </div>
       </header>
 
-      <CrossWorkspacePanel />
+      <CrossWorkspacePanel onScopeChange={setRemoteScope} />
 
       {groupsError && (
         <Alert appearance="danger" title="Couldn't load Worker Groups">
@@ -617,16 +1009,10 @@ function App() {
             <span className="scope-label">
               {groupsLoading
                 ? 'Loading groups…'
-                : `${selectedGroups.size} of ${groups.length} group${groups.length === 1 ? '' : 's'}`}
+                : `${searchScope.length} Worker Group${searchScope.length === 1 ? '' : 's'}${
+                    remoteScope.length ? ` across ${workspaceCount} workspaces` : ''
+                  }`}
             </span>
-            {groups.length > 0 && (
-              <button
-                className="linklike"
-                onClick={() => setShowGroupPicker((s) => !s)}
-              >
-                {showGroupPicker ? 'Hide groups' : 'Choose groups'}
-              </button>
-            )}
             {searching ? (
               <Button variant="secondary" onPress={cancelSearch}>
                 Cancel
@@ -643,68 +1029,6 @@ function App() {
             )}
           </div>
         </div>
-
-        {!groupsLoading && categories.length > 1 && (
-          <div className="scope-categories">
-            <span className="scope-cat-label">Scope:</span>
-            {categories.map(({ cat, groups: cg }) => {
-              const selCount = cg.filter((g) => selectedGroups.has(g.id)).length;
-              const all = selCount === cg.length;
-              return (
-                <Checkbox
-                  key={cat}
-                  checked={all}
-                  indeterminate={selCount > 0 && !all}
-                  onChange={() => setCategorySelected(cg, !all)}
-                >
-                  {`${CATEGORY_LABEL[cat]} (${selCount}/${cg.length})`}
-                </Checkbox>
-              );
-            })}
-          </div>
-        )}
-
-        {showGroupPicker && groups.length > 0 && (
-          <div className="group-picker">
-            <div className="group-picker-head">
-              <button
-                className="linklike"
-                onClick={() => setSelectedGroups(new Set(groups.map((g) => g.id)))}
-              >
-                Select all
-              </button>
-              <button className="linklike" onClick={() => setSelectedGroups(new Set())}>
-                Clear
-              </button>
-            </div>
-            {categories.map(({ cat, groups: cg }) => (
-              <div key={cat} className="group-cat">
-                <div className="group-cat-head">
-                  <Text variant="body">
-                    <strong>{CATEGORY_LABEL[cat]}</strong>
-                  </Text>
-                  <button className="linklike" onClick={() => setCategorySelected(cg, true)}>
-                    all
-                  </button>
-                  <button className="linklike" onClick={() => setCategorySelected(cg, false)}>
-                    none
-                  </button>
-                </div>
-                <div className="group-grid">
-                  {cg.map((g) => (
-                    <Checkbox
-                      key={g.id}
-                      checked={selectedGroups.has(g.id)}
-                      onChange={() => toggleGroup(g.id)}
-                    >
-                      {g.name || g.id}
-                    </Checkbox>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
       </section>
 
       {searching && progress && (
@@ -760,7 +1084,9 @@ function App() {
               <ul className="error-list">
                 {errors.map((e, i) => (
                   <li key={i}>
-                    <WarningOutlined size="xs" /> {e.group.name || e.group.id}: {e.message}
+                    <WarningOutlined size="xs" />{' '}
+                    {e.workspace ? `${e.workspace} / ` : ''}
+                    {e.group.name || e.group.id}: {e.message}
                   </li>
                 ))}
               </ul>
@@ -777,52 +1103,46 @@ function App() {
                   : 'No Sources, Destinations, Routes, or Pipelines matched your keywords in the selected groups.'
               }
             />
-          ) : (
-            ALL_KINDS.filter((k) => kinds.has(k) && grouped[k].length > 0).map((k) => {
-              const isCollapsed = collapsedKinds.has(k);
+          ) : byWorkspace.length > 1 ? (
+            byWorkspace.map(({ key, results: wsResults }) => {
+              const collapsed = collapsedWorkspaces.has(key);
+              const label = key === '' ? 'Local workspace' : key;
               return (
-                <div key={k} className="result-section">
+                <div key={key || '(local)'} className="workspace-section">
                   <button
                     type="button"
-                    className="section-head"
-                    onClick={() => toggleCollapsed(k)}
-                    aria-expanded={!isCollapsed}
+                    className="section-head workspace-head"
+                    onClick={() => toggleWorkspace(key)}
+                    aria-expanded={!collapsed}
                   >
-                    <span className={`section-caret${isCollapsed ? ' collapsed' : ''}`} aria-hidden>
+                    <span className={`section-caret${collapsed ? ' collapsed' : ''}`} aria-hidden>
                       <ChevronDown size="xs" />
                     </span>
                     <Text variant="body">
-                      <strong>{KIND_META[k].plural}</strong>
+                      <strong>{label}</strong>
                     </Text>
                     <Badge
                       appearance="neutral"
-                      count={grouped[k].length}
+                      count={wsResults.length}
                       showZero
-                      aria-label={`${grouped[k].length} ${KIND_META[k].plural}`}
+                      aria-label={`${wsResults.length} matches in ${label}`}
                     />
                   </button>
-                  {!isCollapsed && (
-                    <>
-                      <Divider />
-                      {grouped[k].map((r) => (
-                        <ResultRow
-                          key={`${r.kind}:${r.group.id}:${r.tableId ?? ''}:${r.id}`}
-                          result={r}
-                        />
-                      ))}
-                    </>
-                  )}
+                  {!collapsed && <div className="workspace-body">{renderKindSections(wsResults)}</div>}
                 </div>
               );
             })
+          ) : (
+            renderKindSections(visibleResults)
           )}
         </section>
       )}
 
       {!results && !searching && !groupsLoading && !groupsError && (
         <div className="hint">
-          <ReloadOutlined size="xs" /> Ready — enter keywords above and search across{' '}
-          {selectedGroups.size} of {groups.length} group{groups.length === 1 ? '' : 's'}.
+          <ReloadOutlined size="xs" /> Ready — enter keywords above and search across all{' '}
+          {searchScope.length} Worker Group{searchScope.length === 1 ? '' : 's'}
+          {remoteScope.length ? ` in ${workspaceCount} workspaces` : ''}.
         </div>
       )}
     </div>

@@ -54,6 +54,72 @@ async function pathExists(filePath) {
 }
 
 /**
+ * proxies.yml block granting control-plane egress to one workspace leader:
+ * the group list + per-group (`/m/`) config paths, with the Bearer token
+ * injected from KV. Kept in sync with generateProxiesYaml in src/xws.ts.
+ *
+ * @param {string} host
+ */
+function leaderProxyBlock(host) {
+  return (
+    `${host}:\n` +
+    `  paths:\n` +
+    `    allowlist:\n` +
+    `      - /api/v1/products/stream/groups\n` +
+    `      - /api/v1/m/\n` +
+    `  headers:\n` +
+    `    inject:\n` +
+    `      Authorization: "'Bearer ' + kv.xwsAccessToken"\n` +
+    `    allowlist: [Content-Type, Accept]\n` +
+    `  timeout: 30000\n` +
+    `  rejectUnauthorized: true`
+  );
+}
+
+/**
+ * Compose the proxies.yml to ship: the hand-maintained base (config/proxies.yml)
+ * plus auto-generated per-workspace leader hosts derived from
+ * config/xws-workspaces.json ({ orgId, workspaces: [names] }). This is how
+ * cross-workspace search reaches each leader without anyone editing proxies.yml
+ * by hand — the leader FQDN follows the documented `<name>-<orgId>.cribl.cloud`
+ * pattern. Returns the base unchanged when the workspaces file is missing/empty.
+ *
+ * @param {string} rootDir
+ * @returns {Promise<string>}
+ */
+async function composeProxiesYml(rootDir) {
+  const proxiesPath = join(rootDir, 'config', 'proxies.yml');
+  const base = (await pathExists(proxiesPath)) ? await readFile(proxiesPath, 'utf8') : '';
+
+  const wsPath = join(rootDir, 'config', 'xws-workspaces.json');
+  if (!(await pathExists(wsPath))) return base;
+
+  let cfg;
+  try {
+    cfg = JSON.parse(await readFile(wsPath, 'utf8'));
+  } catch {
+    return base; // malformed config — ship the base rather than a broken file
+  }
+
+  const orgId = String(cfg?.orgId ?? '').trim();
+  const names = Array.isArray(cfg?.workspaces)
+    ? cfg.workspaces.map((n) => String(n).trim()).filter(Boolean)
+    : [];
+  if (!orgId || names.length === 0) return base;
+
+  const hosts = [...new Set(names.map((n) => `${n}-${orgId}.cribl.cloud`))].sort();
+  const generated = hosts.map(leaderProxyBlock).join('\n');
+  const sep = base && !base.endsWith('\n') ? '\n' : '';
+  return (
+    `${base}${sep}\n` +
+    `# --- Auto-generated cross-workspace leader hosts ---\n` +
+    `# Source: config/xws-workspaces.json. Do not edit by hand; change that file\n` +
+    `# (add/remove workspace names) and repack to regenerate.\n` +
+    `${generated}\n`
+  );
+}
+
+/**
  * Materialize the Cribl App Platform pack layout at the repo root for Git-based
  * installs. Writes `static/` (from `dist/`) and `default/proxies.yml` +
  * `default/policies.yml` (from `config/`). Run after `npm run build`; the root
@@ -65,7 +131,6 @@ async function pathExists(filePath) {
 export async function prepareGitPackLayout(_versionOverride = undefined) {
   const rootDir = join(__dirname, '..');
   const distDir = join(rootDir, 'dist');
-  const proxiesPath = join(rootDir, 'config', 'proxies.yml');
   const policiesPath = join(rootDir, 'config', 'policies.yml');
   const staticDir = join(rootDir, 'static');
   const defaultDir = join(rootDir, 'default');
@@ -82,8 +147,9 @@ export async function prepareGitPackLayout(_versionOverride = undefined) {
 
   await cp(distDir, staticDir, { recursive: true });
 
-  if (await pathExists(proxiesPath)) {
-    await cp(proxiesPath, join(defaultDir, 'proxies.yml'));
+  const proxiesYml = await composeProxiesYml(rootDir);
+  if (proxiesYml) {
+    await writeFile(join(defaultDir, 'proxies.yml'), proxiesYml);
   }
 
   if (await pathExists(policiesPath)) {
@@ -99,7 +165,6 @@ export async function createAppPack(dev = false) {
   const rootDir = join(__dirname, '..');
   const buildDir = join(rootDir, 'package-build');
   const distDir = join(rootDir, 'dist');
-  const proxiesPath = join(rootDir, 'config', 'proxies.yml');
   const policiesPath = join(rootDir, 'config', 'policies.yml');
 
   if (await pathExists(buildDir)) {
@@ -117,8 +182,9 @@ export async function createAppPack(dev = false) {
     await cp(distDir, join(buildDir, 'static'), { recursive: true });
   }
 
-  if (await pathExists(proxiesPath)) {
-    await cp(proxiesPath, join(buildDir, 'default', 'proxies.yml'));
+  const proxiesYml = await composeProxiesYml(rootDir);
+  if (proxiesYml) {
+    await writeFile(join(buildDir, 'default', 'proxies.yml'), proxiesYml);
   }
 
   if (await pathExists(policiesPath)) {
