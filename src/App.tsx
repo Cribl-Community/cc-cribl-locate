@@ -500,6 +500,12 @@ function CrossWorkspacePanel({
 
   const canTest = configComplete(cfg) && !testing;
 
+  // A successful "Resume with saved session token" step means the app
+  // auto-connected from the token saved in KV — surface that in the heading.
+  const resumedFromSaved = steps.some(
+    (s) => s.ok && s.step === 'Resume with saved session token',
+  );
+
   const runTest = useCallback(() => connect(cfg), [connect, cfg]);
 
   return (
@@ -515,6 +521,7 @@ function CrossWorkspacePanel({
         </span>
         <Text variant="body">
           <strong>Cross-workspace search</strong>
+          {resumedFromSaved && <span className="result-dim"> (already configured)</span>}
         </Text>
       </button>
 
