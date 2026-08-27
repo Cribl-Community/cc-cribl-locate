@@ -516,9 +516,6 @@ function CrossWorkspacePanel({
         <Text variant="body">
           <strong>Cross-workspace search</strong>
         </Text>
-        <Tag color="highlight" size="sm">
-          beta
-        </Tag>
       </button>
 
       {open && (
