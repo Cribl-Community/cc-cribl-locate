@@ -62,6 +62,22 @@ Install directly from this repository using Cribl's **Import from Git**.
 5. (Optional) Narrow the scope to specific Worker Groups or Fleets, and toggle enabled/disabled results.
 6. Click **Search**. Expand or collapse each result section, open the owning group, or **Export CSV**.
 
+### Cross-Workspace Search
+
+By default, Cribl Locate searches every Worker Group and Fleet in the **local** workspace (the one the app is installed in). To search across *other* Cribl.Cloud workspaces in your organization, connect an org-level API credential:
+
+1. In Cribl.Cloud, go to **Organization → API Credentials** and create an API client that can read workspaces. Note its **Client ID** and **Client Secret**, and your **Organization ID**.
+2. In Cribl Locate, expand the **Cross-workspace search** panel.
+3. Enter the **Organization ID**, **API Client ID**, and **API Client Secret**, then click **Test connection**. The panel walks through each step (token exchange, workspace listing, per-workspace group discovery) and reports success or the exact failure.
+4. On success, every visible workspace is listed with its Worker Groups. All non-Search groups across all workspaces are added to the search scope by default; use the per-workspace checkboxes to narrow it down.
+5. Run a search as usual. Results are grouped by workspace, and matches from other workspaces are tagged with the workspace name.
+
+Notes:
+
+- **The client secret is never stored.** It is used once to mint a short-lived access token; only the encrypted token is saved. When the token expires, re-enter the secret and test the connection again.
+- Cross-workspace search reaches other workspaces' Leaders through the platform proxy over external egress (`login.cribl.cloud`, `api.cribl.cloud`, and each workspace's Leader host). See [Permissions](#permissions).
+- Per-workspace Leader hostnames can't be wildcarded and aren't known at pack time. If a workspace's group list looks incomplete, add its name to `config/xws-workspaces.json` and repack so its Leader host is declared in `proxies.yml`.
+
 ## Permissions
 
 Cribl Locate reads configuration from the Cribl REST API through the platform proxy (which injects auth automatically). It is read-only and gracefully skips any group it cannot read, showing a per-group error instead of failing the whole search.
